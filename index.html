@@ -373,7 +373,7 @@ let STATE = {
 
 async function loadData() {
   try {
-    const res = await fetch('data.json');
+    const res = await fetch('/api/data');
     if (!res.ok) throw new Error('HTTP ' + res.status);
     return await res.json();
   } catch(e) { return null; }

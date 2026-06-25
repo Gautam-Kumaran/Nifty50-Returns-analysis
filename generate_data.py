@@ -18,9 +18,10 @@ from datetime import datetime, timedelta
 try:
     import yfinance as yf
     import pandas as pd
+    import pandas_market_calendars as mcal
 except ImportError as e:
     print(f"Missing dependency: {e}")
-    print("Install with:  pip install yfinance pandas")
+    print("Install with:  pip install yfinance pandas pandas_market_calendars")
     sys.exit(1)
 
 
@@ -30,54 +31,77 @@ START_DATE  = "2008-01-01"
 END_DATE    = datetime.today().strftime("%Y-%m-%d")
 OUTPUT_FILE = "data.json"
 # ──────────────────────────────────────────────────────────────────────────────
+# ── Expiry regime constants ───────────────────────────────────────────────────
+from datetime import date
+
+WEEKLY_OPTIONS_START = date(2019, 2, 1)   # Nifty weekly options launched
+TUESDAY_EXPIRY_START = date(2025, 9, 1)   # SEBI shift: Thursday → Tuesday
+EXPIRY_WEEKDAY_OLD   = 3                  # Thursday (0=Mon)
+EXPIRY_WEEKDAY_NEW   = 1                  # Tuesday  (0=Mon)
+
+# ── NSE holiday set ───────────────────────────────────────────────────────────
+_nse = mcal.get_calendar("NSE")
+_schedule = _nse.schedule(start_date="2008-01-01", end_date="2026-12-31")
+NSE_TRADING_DAYS = set(_schedule.index.date)
 
 
-def get_last_thursday(year, month):
-    """Return the last Thursday of a given month (monthly expiry day)."""
-    # Find last day of month
-    if month == 12:
-        last_day = datetime(year + 1, 1, 1) - timedelta(days=1)
+def days_to_monthly_expiry(d):
+    """How many calendar days until the next monthly expiry (holiday-adjusted)?"""
+    y, m = d.year, d.month
+    expiry = get_monthly_expiry(y, m)
+    if d > expiry:
+        # Roll to next month
+        if m == 12:
+            expiry = get_monthly_expiry(y + 1, 1)
+        else:
+            expiry = get_monthly_expiry(y, m + 1)
+    return (expiry - d).days
+
+def get_monthly_expiry(year, month):
+    """Return the correct monthly expiry date, shifted back if it falls on a holiday."""
+    # Determine which weekday is the expiry day for this date
+    ref = date(year, month, 1)
+    if date(year, month, 1) >= TUESDAY_EXPIRY_START:
+        target_weekday = EXPIRY_WEEKDAY_NEW  # Tuesday
     else:
-        last_day = datetime(year, month + 1, 1) - timedelta(days=1)
-    # Walk back to Thursday (weekday 3)
-    while last_day.weekday() != 3:
+        target_weekday = EXPIRY_WEEKDAY_OLD  # Thursday
+
+    # Find last occurrence of that weekday in the month
+    if month == 12:
+        last_day = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last_day = date(year, month + 1, 1) - timedelta(days=1)
+
+    while last_day.weekday() != target_weekday:
         last_day -= timedelta(days=1)
+
+    # Shift back if it's a holiday
+    while last_day not in NSE_TRADING_DAYS:
+        last_day -= timedelta(days=1)
+
     return last_day
 
 
-def get_all_thursdays(year, month):
-    """Return all Thursdays in a given month (weekly expiry days)."""
-    thursdays = []
-    d = datetime(year, month, 1)
-    while d.month == month:
-        if d.weekday() == 3:
-            thursdays.append(d)
-        d += timedelta(days=1)
-    return thursdays
+def get_weekly_expiry(d):
+    """
+    Return the next weekly expiry date on or after date d.
+    Returns None if weekly options didn't exist yet (before Feb 2019).
+    """
+    if d < WEEKLY_OPTIONS_START:
+        return None
 
+    target_weekday = EXPIRY_WEEKDAY_NEW if d >= TUESDAY_EXPIRY_START else EXPIRY_WEEKDAY_OLD
 
-def days_to_monthly_expiry(date):
-    """How many calendar days until the next monthly expiry (last Thursday)?"""
-    y, m = date.year, date.month
-    expiry = get_last_thursday(y, m)
-    if date > expiry:
-        # Roll to next month
-        if m == 12:
-            expiry = get_last_thursday(y + 1, 1)
-        else:
-            expiry = get_last_thursday(y, m + 1)
-    return (expiry - date).days
+    candidate = d
+    # Find the next occurrence of the target weekday
+    days_ahead = (target_weekday - d.weekday()) % 7
+    candidate = d + timedelta(days=days_ahead)
 
+    # Shift back if it's a holiday
+    while candidate not in NSE_TRADING_DAYS:
+        candidate -= timedelta(days=1)
 
-def days_to_weekly_expiry(date):
-    """How many calendar days until the next Thursday?"""
-    days_ahead = 3 - date.weekday()  # Thursday = 3
-    if days_ahead < 0:
-        days_ahead += 7
-    elif days_ahead == 0:
-        days_ahead = 0
-    return days_ahead
-
+    return candidate
 
 def classify_bucket(r):
     """Return the gain-bucket label for a daily return (in %)."""
@@ -134,17 +158,25 @@ def main():
         volume      = int(row["volume"]) if not pd.isna(row["volume"]) else 0
 
         # Expiry timing
-        dte_monthly = days_to_monthly_expiry(date)
-        dte_weekly  = days_to_weekly_expiry(date)
-        monthly_exp = get_last_thursday(date.year, date.month)
-        is_monthly_expiry_day = (date.date() == monthly_exp.date())
+# Expiry timing
+        d = date.date()
+        dte_monthly       = days_to_monthly_expiry(d)
+        monthly_exp       = get_monthly_expiry(d.year, d.month)
+        is_monthly_expiry_day = (d == monthly_exp)
+        is_expiry_week    = dte_monthly <= 7
 
-        # Expiry week = last 5 trading days before monthly expiry
-        # Simple proxy: dte_monthly <= 7
-        is_expiry_week = dte_monthly <= 7
+        # Weekly expiry (None before Feb 2019)
+        weekly_exp        = get_weekly_expiry(d)
+        dte_weekly        = (weekly_exp - d).days if weekly_exp is not None else None
+        is_weekly_expiry  = (d == weekly_exp) if weekly_exp is not None else None
 
-        # Gap vs intraday: was the breach driven by a gap or session move?
-        # gap_dominated = abs(gap) > abs(intraday)
+        # Expiry regime
+        if d >= TUESDAY_EXPIRY_START:
+            expiry_regime = "tuesday"
+        else:
+            expiry_regime = "thursday"
+
+        # Gap vs intraday
         gap_dominated = abs(gap) > abs(intraday)
 
         records.append({
@@ -158,12 +190,14 @@ def main():
             "bucket":             classify_bucket(ret),
             "month":              date.month,
             "year":               date.year,
-            "day_of_week":        date.weekday(),   # 0=Mon, 4=Fri
+            "day_of_week":        date.weekday(),
             "dte_monthly":        dte_monthly,
             "dte_weekly":         dte_weekly,
             "is_monthly_expiry":  is_monthly_expiry_day,
+            "is_weekly_expiry":   is_weekly_expiry,
             "is_expiry_week":     is_expiry_week,
             "gap_dominated":      gap_dominated,
+            "expiry_regime":      expiry_regime,
         })
 
     # ── Group by year ──────────────────────────────────────────────────────
